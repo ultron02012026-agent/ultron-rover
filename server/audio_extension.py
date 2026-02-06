@@ -128,10 +128,10 @@ class CollisionAudio:
     
     # Audio categories for different collision types
     CLIPS = {
-        "impact": ["ow_1.mp3", "ow_2.mp3", "ow_3.mp3", "dammit.mp3"],
-        "close_call": ["whoa.mp3", "watch_it.mp3"],
-        "stuck": ["help.mp3", "stuck.mp3", "meant_to_do_that.mp3"],
-        "dramatic": ["wilhelm.mp3", "nooo.mp3"],
+        "impact": ["ow_1.wav", "ow_2.wav", "ow_3.wav", "dammit.wav", "wilhelm.wav"],
+        "close_call": ["whoa.wav"],
+        "stuck": ["stuck.wav", "meant_to_do_that.wav", "why.wav"],
+        "dramatic": ["wilhelm.wav", "nooo.wav"],
     }
     
     def __init__(self, audio_player: AudioPlayer):

@@ -64,8 +64,12 @@ When ultrasonic sensor detects sudden distance decrease (hit something):
 2. Random audio clip plays from `audio/` folder
 3. After 2 seconds, control resumes
 
-Audio clips in `audio/`:
-- `ow_1.mp3` through `ow_5.mp3` - pain sounds
-- `dammit.mp3` - frustration
-- `meant_to_do_that.mp3` - denial
-- `wilhelm.mp3` - classic scream
+Audio clips (auto-generated on Pi):
+- `wilhelm.wav` - THE Wilhelm scream
+- `ow_1.wav` through `ow_3.wav` - pain sounds  
+- `dammit.wav` - frustration
+- `meant_to_do_that.wav` - denial
+- `nooo.wav` - dramatic
+- `why.wav` - existential crisis
+
+**Add your own:** Drop any `.wav` or `.mp3` files into `~/audio/` on the Pi. The collision handler picks randomly from whatever's there.
