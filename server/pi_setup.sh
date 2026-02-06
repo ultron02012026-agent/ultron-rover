@@ -39,16 +39,28 @@ sudo python3 setup.py
 echo "🔊 Setting up audio..."
 mkdir -p ~/audio
 
-# Generate some basic audio clips with espeak
-echo "Generating audio clips..."
+# Download actual scream sound effects (royalty-free)
+echo "Downloading audio clips..."
+AUDIO_URL="https://github.com/ultron02012026-agent/ultron-rover/raw/main/audio"
+
+# Wilhelm scream (classic)
+curl -sSL "https://upload.wikimedia.org/wikipedia/commons/d/d9/Wilhelm_Scream.ogg" -o ~/audio/wilhelm.ogg
+
+# Generate some TTS clips as backup
+echo "Generating TTS clips..."
 espeak -w ~/audio/ow_1.wav "Ow! That hurt!"
-espeak -w ~/audio/ow_2.wav "Ouch!"
+espeak -w ~/audio/ow_2.wav "Ouch! What the hell!"
 espeak -w ~/audio/ow_3.wav "Hey! Watch it!"
-espeak -w ~/audio/dammit.wav "Dammit!"
+espeak -w ~/audio/dammit.wav "God dammit!"
 espeak -w ~/audio/meant_to_do_that.wav "I meant to do that."
-espeak -w ~/audio/help.wav "Help! I'm stuck!"
+espeak -w ~/audio/stuck.wav "Help! I'm stuck!"
 espeak -w ~/audio/whoa.wav "Whoa! That was close!"
 espeak -w ~/audio/hello.wav "Hello! I am Ultron."
+espeak -w ~/audio/nooo.wav "Nooooooo!"
+espeak -w ~/audio/why.wav "Why does this keep happening to me?"
+
+# Convert ogg to wav for compatibility
+ffmpeg -i ~/audio/wilhelm.ogg ~/audio/wilhelm.wav -y 2>/dev/null || true
 
 # Configure audio output
 echo "🔊 Configuring audio output..."
