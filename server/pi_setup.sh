@@ -67,10 +67,10 @@ ctl.!default {
 EOF
 fi
 
-# Copy our extensions
-echo "📁 Copying Ultron extensions..."
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-cp $SCRIPT_DIR/audio_extension.py $FREENOVE_DIR/Code/Server/
+# Download and copy our extensions
+echo "📁 Downloading Ultron extensions..."
+ULTRON_REPO="https://raw.githubusercontent.com/ultron02012026-agent/ultron-rover/main"
+curl -sSL "$ULTRON_REPO/server/audio_extension.py" -o $FREENOVE_DIR/Code/Server/audio_extension.py
 
 # Create systemd service for auto-start
 echo "⚙️ Creating systemd service..."
