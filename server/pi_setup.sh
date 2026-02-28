@@ -21,7 +21,10 @@ sudo apt install -y \
     mpv \
     espeak \
     libportaudio2 \
-    alsa-utils
+    alsa-utils \
+    portaudio19-dev \
+    python3-pyaudio \
+    flac
 
 # Clone Freenove repo if not present
 FREENOVE_DIR=~/Freenove_4WD_Smart_Car_Kit_for_Raspberry_Pi
@@ -83,6 +86,12 @@ fi
 echo "📁 Downloading Ultron extensions..."
 ULTRON_REPO="https://raw.githubusercontent.com/ultron02012026-agent/ultron-rover/main"
 curl -sSL "$ULTRON_REPO/server/audio_extension.py" -o $FREENOVE_DIR/Code/Server/audio_extension.py
+curl -sSL "$ULTRON_REPO/server/voice_listener.py" -o $FREENOVE_DIR/Code/Server/voice_listener.py
+
+# Install Python packages for voice
+echo "🎤 Installing voice dependencies..."
+pip3 install --break-system-packages webrtcvad requests 2>/dev/null || \
+pip3 install webrtcvad requests
 
 # Create systemd service for auto-start
 echo "⚙️ Creating systemd service..."
