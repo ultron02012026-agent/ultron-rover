@@ -90,8 +90,18 @@ curl -sSL "$ULTRON_REPO/server/voice_listener.py" -o $FREENOVE_DIR/Code/Server/v
 
 # Install Python packages for voice
 echo "🎤 Installing voice dependencies..."
-pip3 install --break-system-packages webrtcvad requests 2>/dev/null || \
-pip3 install webrtcvad requests
+pip3 install --break-system-packages pvporcupine webrtcvad requests 2>/dev/null || \
+pip3 install pvporcupine webrtcvad requests
+
+echo ""
+echo "🎯 Wake word setup:"
+echo "   1. Get free key: https://console.picovoice.ai"
+echo "   2. Train 'Hey Ultron' wake word (select Raspberry Pi platform)"
+echo "   3. Download the .ppn file to ~/hey_ultron.ppn"
+echo "   4. Set environment variables:"
+echo "      export PICOVOICE_ACCESS_KEY='your_key'"
+echo "      export WAKE_WORD_PATH=~/hey_ultron.ppn"
+echo ""
 
 # Create systemd service for auto-start
 echo "⚙️ Creating systemd service..."

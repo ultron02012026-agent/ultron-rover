@@ -1,229 +1,230 @@
 #!/usr/bin/env python3
 """
-Ultron Rover Voice Listener
+Ultron Rover Voice Listener — "Hey Ultron" Architecture
 
-Listens on the USB microphone for speech, sends it to Ultron (Mac mini)
-for processing, and plays back responses on the USB speaker.
+All processing runs locally on the Pi until wake word is detected.
+NO audio is stored on disk. Ever. Everything streams through memory.
 
-Architecture:
-  1. VAD (Voice Activity Detection) via webrtcvad - detects when someone's talking
-  2. Records speech chunks
-  3. Sends audio to Mac mini API for transcription + processing
-  4. Receives text response + optional commands (drive, lights, etc.)
-  5. Plays TTS response on speaker via espeak/piper
+Flow:
+  1. Porcupine wake word engine listens for "Hey Ultron" (on-device, zero API calls)
+  2. On detection → beep confirmation → start recording speech
+  3. VAD detects end of speech → send audio bytes directly to Mac mini (in memory)
+  4. Mac mini transcribes + processes → sends response
+  5. Pi plays response on speaker → back to wake word listening
 
-Dependencies (installed by setup):
+Dependencies:
+  - pvporcupine (wake word, on-device)
   - pyaudio (mic input)
-  - webrtcvad (voice activity detection)
-  - requests (API calls to Mac mini)
+  - webrtcvad (speech endpoint detection)
+  - requests (send audio to Mac mini)
 """
 
 import pyaudio
-import wave
 import struct
 import time
 import os
+import io
+import wave
 import json
 import subprocess
 import threading
-import tempfile
 import sys
-from pathlib import Path
+
+try:
+    import pvporcupine
+    HAS_PORCUPINE = True
+except ImportError:
+    HAS_PORCUPINE = False
+    print("⚠️  pvporcupine not installed — falling back to energy-based detection")
+    print("   Install: pip3 install pvporcupine")
 
 try:
     import webrtcvad
     HAS_VAD = True
 except ImportError:
     HAS_VAD = False
-    print("WARNING: webrtcvad not installed, using simple energy-based VAD")
 
 try:
     import requests
     HAS_REQUESTS = True
 except ImportError:
     HAS_REQUESTS = False
-    print("WARNING: requests not installed, running in local-only mode")
+    print("⚠️  requests not installed")
 
 
-# ── Audio Config ──────────────────────────────────────────────
-RATE = 16000          # 16kHz for speech recognition
-CHANNELS = 1          # Mono
+# ── Config ────────────────────────────────────────────────────
+
+# Picovoice access key (set via environment variable)
+PICOVOICE_ACCESS_KEY = os.environ.get("PICOVOICE_ACCESS_KEY", "")
+
+# Custom wake word model path (train "Hey Ultron" at console.picovoice.ai)
+# If not set, falls back to built-in "computer" keyword for testing
+WAKE_WORD_PATH = os.environ.get("WAKE_WORD_PATH", "")
+
+# Audio
+RATE = 16000
+CHANNELS = 1
 FORMAT = pyaudio.paInt16
-FRAME_DURATION_MS = 30   # 30ms frames for VAD
-FRAME_SIZE = int(RATE * FRAME_DURATION_MS / 1000)  # 480 samples per frame
 
-# VAD sensitivity (0=least aggressive, 3=most aggressive filtering)
-VAD_MODE = 2
+# Speech recording
+MAX_SPEECH_SECONDS = 15
+SILENCE_TIMEOUT_MS = 900    # ms of silence to end recording
+VAD_MODE = 2                # 0-3, higher = more aggressive filtering
+FRAME_DURATION_MS = 30
+FRAME_SIZE = int(RATE * FRAME_DURATION_MS / 1000)
 
-# Speech detection thresholds
-MIN_SPEECH_FRAMES = 10      # Minimum frames to count as speech (~300ms)
-MAX_SPEECH_SECONDS = 15     # Max recording length
-SILENCE_TIMEOUT_FRAMES = 30 # Frames of silence to end recording (~900ms)
-PRE_SPEECH_BUFFER = 10      # Keep N frames before speech detected
-
-# ── Ultron Mac Mini Connection ────────────────────────────────
+# Ultron Mac mini
 ULTRON_HOST = os.environ.get("ULTRON_HOST", "ultrons-mini.local")
 ULTRON_PORT = int(os.environ.get("ULTRON_PORT", "5555"))
 ULTRON_API = f"http://{ULTRON_HOST}:{ULTRON_PORT}"
 
-# ── Audio Output ──────────────────────────────────────────────
+# Speaker
 SPEAKER_DEVICE = os.environ.get("SPEAKER_DEVICE", "plughw:2,0")
 
 
-class SimpleVAD:
-    """Energy-based VAD fallback when webrtcvad isn't available."""
-
-    def __init__(self, threshold=500):
-        self.threshold = threshold
-
-    def is_speech(self, audio_data, sample_rate):
-        samples = struct.unpack(f'{len(audio_data)//2}h', audio_data)
-        energy = sum(abs(s) for s in samples) / len(samples)
-        return energy > self.threshold
-
-
-class VoiceListener:
-    """Continuously listens for speech and processes commands."""
+class UltronVoice:
+    """Hey Ultron wake word + voice command system."""
 
     def __init__(self):
         self.audio = pyaudio.PyAudio()
-        self.running = False
         self.mic_index = self._find_usb_mic()
-
-        if HAS_VAD:
-            self.vad = webrtcvad.Vad(VAD_MODE)
-        else:
-            self.vad = SimpleVAD()
-
-        # Audio output lock (don't listen while speaking)
+        self.running = False
         self.speaking = False
         self._speak_lock = threading.Lock()
 
-        print(f"🎤 Mic: device {self.mic_index}")
-        print(f"🔊 Speaker: {SPEAKER_DEVICE}")
-        print(f"🧠 Ultron API: {ULTRON_API}")
+        # Wake word engine
+        self.porcupine = None
+        if HAS_PORCUPINE and PICOVOICE_ACCESS_KEY:
+            try:
+                if WAKE_WORD_PATH and os.path.exists(WAKE_WORD_PATH):
+                    # Custom "Hey Ultron" model
+                    self.porcupine = pvporcupine.create(
+                        access_key=PICOVOICE_ACCESS_KEY,
+                        keyword_paths=[WAKE_WORD_PATH]
+                    )
+                    print("🎯 Wake word: Hey Ultron (custom model)")
+                else:
+                    # Fallback to built-in keyword for testing
+                    self.porcupine = pvporcupine.create(
+                        access_key=PICOVOICE_ACCESS_KEY,
+                        keywords=["computer"]
+                    )
+                    print("🎯 Wake word: 'Computer' (testing mode)")
+                    print("   Train 'Hey Ultron' at https://console.picovoice.ai")
+            except Exception as e:
+                print(f"⚠️  Porcupine init failed: {e}")
+                self.porcupine = None
+
+        if not self.porcupine:
+            print("🎯 Wake word: energy-based fallback (say anything loud)")
+
+        # VAD for speech endpoint detection
+        if HAS_VAD:
+            self.vad = webrtcvad.Vad(VAD_MODE)
+        else:
+            self.vad = None
 
     def _find_usb_mic(self):
-        """Find the USB microphone device index."""
+        """Find USB microphone device index."""
         for i in range(self.audio.get_device_count()):
             info = self.audio.get_device_info_by_index(i)
             name = info.get('name', '').lower()
             if 'usb' in name and info.get('maxInputChannels', 0) > 0:
-                print(f"  Found USB mic: {info['name']} (index {i})")
+                print(f"🎤 Mic: {info['name']} (index {i})")
                 return i
-        # Fallback to default input
-        print("  No USB mic found, using default input")
+        print("🎤 Mic: default input")
         return None
 
-    def _is_speech(self, frame_data):
-        """Check if audio frame contains speech."""
-        if HAS_VAD:
-            try:
-                return self.vad.is_speech(frame_data, RATE)
-            except Exception:
-                return False
-        else:
-            return self.vad.is_speech(frame_data, RATE)
+    def beep(self, freq=800, duration_ms=150):
+        """Play a short beep to confirm wake word detected. No disk writes."""
+        try:
+            subprocess.run(
+                ['ffplay', '-nodisp', '-autoexit', '-volume', '80',
+                 '-f', 'lavfi', '-i', f'sine=frequency={freq}:duration={duration_ms/1000}'],
+                capture_output=True, timeout=3,
+                env={**os.environ, 'AUDIODEV': SPEAKER_DEVICE}
+            )
+        except Exception:
+            pass
 
-    def speak(self, text, voice="Whisper"):
-        """Play TTS response through the speaker."""
+    def speak(self, text):
+        """TTS response through speaker. No files saved to disk."""
+        if not text or text == '...':
+            return
         with self._speak_lock:
             self.speaking = True
             try:
-                # Try piper first (better quality), fall back to espeak
-                tmp = tempfile.mktemp(suffix='.wav')
-                try:
-                    # espeak fallback
-                    subprocess.run(
-                        ['espeak', '-v', 'en', '-s', '140', '-w', tmp, text],
-                        capture_output=True, timeout=10
-                    )
-                except FileNotFoundError:
-                    # Last resort: use ffplay with sine wave beep
-                    print(f"  No TTS available, printing: {text}")
-                    return
-
-                if os.path.exists(tmp):
-                    subprocess.run(
-                        ['ffplay', '-nodisp', '-autoexit', '-volume', '100',
-                         '-af', f'aformat=sample_rates=22050',
-                         tmp],
-                        capture_output=True, timeout=30,
-                        env={**os.environ, 'AUDIODEV': SPEAKER_DEVICE}
-                    )
-                    os.unlink(tmp)
+                # Generate TTS to stdout pipe, play directly (no disk)
+                espeak = subprocess.Popen(
+                    ['espeak', '-v', 'en', '-s', '150', '--stdout', text],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+                )
+                subprocess.run(
+                    ['ffplay', '-nodisp', '-autoexit', '-volume', '100', '-i', 'pipe:0'],
+                    stdin=espeak.stdout, capture_output=True, timeout=30,
+                    env={**os.environ, 'AUDIODEV': SPEAKER_DEVICE}
+                )
+                espeak.wait()
+            except Exception as e:
+                print(f"  TTS error: {e}")
             finally:
                 self.speaking = False
 
     def record_speech(self, stream):
-        """Record audio until speech ends. Returns WAV bytes or None."""
+        """
+        Record speech after wake word. Returns WAV bytes in memory.
+        NOTHING is written to disk.
+        """
         frames = []
-        speech_frames = 0
         silence_frames = 0
-        ring_buffer = []  # Pre-speech buffer
-        recording = False
-        total_frames = 0
         max_frames = int(MAX_SPEECH_SECONDS * 1000 / FRAME_DURATION_MS)
+        silence_limit = int(SILENCE_TIMEOUT_MS / FRAME_DURATION_MS)
 
-        while total_frames < max_frames:
+        print("  🔴 Listening...")
+
+        for _ in range(max_frames):
             try:
                 data = stream.read(FRAME_SIZE, exception_on_overflow=False)
             except IOError:
                 continue
 
-            total_frames += 1
-            is_speech = self._is_speech(data)
+            frames.append(data)
 
-            if not recording:
-                # Buffer pre-speech audio
-                ring_buffer.append(data)
-                if len(ring_buffer) > PRE_SPEECH_BUFFER:
-                    ring_buffer.pop(0)
+            # Check for speech end
+            is_speech = True
+            if self.vad:
+                try:
+                    is_speech = self.vad.is_speech(data, RATE)
+                except Exception:
+                    pass
 
-                if is_speech:
-                    speech_frames += 1
-                    if speech_frames >= MIN_SPEECH_FRAMES:
-                        # Speech confirmed! Start recording
-                        recording = True
-                        frames = list(ring_buffer)  # Include pre-speech
-                        print("  🔴 Recording...")
-                else:
-                    speech_frames = max(0, speech_frames - 1)
+            if not is_speech:
+                silence_frames += 1
+                if silence_frames >= silence_limit and len(frames) > 10:
+                    break
             else:
-                frames.append(data)
-                if is_speech:
-                    silence_frames = 0
-                else:
-                    silence_frames += 1
-                    if silence_frames >= SILENCE_TIMEOUT_FRAMES:
-                        # Speech ended
-                        break
+                silence_frames = 0
 
-        if not recording or len(frames) < MIN_SPEECH_FRAMES:
+        if len(frames) < 5:
             return None
 
         duration = len(frames) * FRAME_DURATION_MS / 1000
-        print(f"  ⏹️  Captured {duration:.1f}s of audio")
+        print(f"  ⏹️  Got {duration:.1f}s")
 
-        # Convert to WAV bytes
-        tmp = tempfile.mktemp(suffix='.wav')
-        with wave.open(tmp, 'wb') as wf:
+        # Build WAV in memory — no disk writes
+        buffer = io.BytesIO()
+        with wave.open(buffer, 'wb') as wf:
             wf.setnchannels(CHANNELS)
-            wf.setsampwidth(2)  # 16-bit
+            wf.setsampwidth(2)
             wf.setframerate(RATE)
             wf.writeframes(b''.join(frames))
 
-        with open(tmp, 'rb') as f:
-            wav_bytes = f.read()
-        os.unlink(tmp)
-        return wav_bytes
+        return buffer.getvalue()
 
     def send_to_ultron(self, wav_bytes):
-        """Send recorded audio to Ultron Mac mini for processing."""
+        """Send audio bytes to Mac mini. Nothing touches disk."""
         if not HAS_REQUESTS:
-            print("  No requests library — can't reach Ultron")
             return None
-
         try:
             resp = requests.post(
                 f"{ULTRON_API}/voice",
@@ -232,99 +233,120 @@ class VoiceListener:
             )
             if resp.status_code == 200:
                 return resp.json()
-            else:
-                print(f"  Ultron API error: {resp.status_code}")
-                return None
         except requests.exceptions.ConnectionError:
-            print(f"  Can't reach Ultron at {ULTRON_API}")
-            return None
+            print(f"  ❌ Can't reach Ultron at {ULTRON_API}")
         except Exception as e:
-            print(f"  Error sending to Ultron: {e}")
-            return None
+            print(f"  ❌ Error: {e}")
+        return None
 
-    def process_response(self, response):
-        """Process Ultron's response — speak and/or execute commands."""
-        if not response:
+    def handle_wake(self, stream):
+        """Wake word detected — record, send, respond."""
+        print("  ✨ Hey Ultron!")
+
+        # Confirmation beep
+        self.beep(800, 150)
+        time.sleep(0.1)
+        self.beep(1200, 100)
+
+        # Record speech (in memory only)
+        wav_bytes = self.record_speech(stream)
+        if not wav_bytes:
+            self.speak("I didn't catch that.")
             return
 
-        # Speak the response
-        text = response.get('text', '')
-        if text:
-            print(f"  🗣️  Ultron says: {text}")
-            self.speak(text)
+        # Send to Mac mini
+        print("  📤 Processing...")
+        response = self.send_to_ultron(wav_bytes)
 
-        # Execute motor commands if any
-        commands = response.get('commands', [])
-        for cmd in commands:
-            print(f"  ⚡ Command: {cmd}")
-            # Commands will be handled by rover_api integration
+        # wav_bytes is now garbage collected — never hit disk
+        del wav_bytes
 
-    def listen_loop(self):
-        """Main listening loop."""
+        if response:
+            text = response.get('text', '')
+            if text:
+                print(f"  🗣️  {text}")
+                self.speak(text)
+
+            commands = response.get('commands', [])
+            for cmd in commands:
+                print(f"  ⚡ {cmd}")
+                # TODO: execute motor/LED/audio commands via Freenove API
+        else:
+            self.speak("Sorry, I couldn't process that.")
+
+    def run(self):
+        """Main loop. Wake word detection runs entirely on-device."""
         print("\n🤖 Ultron Rover Voice System")
         print("=" * 40)
-        print("Listening for speech...\n")
+
+        if self.porcupine:
+            frame_length = self.porcupine.frame_length
+            sample_rate = self.porcupine.sample_rate
+        else:
+            frame_length = FRAME_SIZE
+            sample_rate = RATE
 
         stream = self.audio.open(
             format=FORMAT,
             channels=CHANNELS,
-            rate=RATE,
+            rate=sample_rate,
             input=True,
             input_device_index=self.mic_index,
-            frames_per_buffer=FRAME_SIZE
+            frames_per_buffer=frame_length
         )
 
         self.running = True
-        idle_count = 0
+        print(f"👂 Waiting for wake word...\n")
 
         try:
             while self.running:
-                # Don't listen while speaking
                 if self.speaking:
                     time.sleep(0.1)
                     continue
 
-                # Check for speech
                 try:
-                    data = stream.read(FRAME_SIZE, exception_on_overflow=False)
+                    pcm = stream.read(frame_length, exception_on_overflow=False)
                 except IOError:
                     continue
 
-                if self._is_speech(data):
-                    # Potential speech detected — try to record full utterance
-                    wav_bytes = self.record_speech(stream)
-
-                    if wav_bytes:
-                        print("  📤 Sending to Ultron...")
-                        response = self.send_to_ultron(wav_bytes)
-                        self.process_response(response)
-                        print("  👂 Listening...\n")
+                if self.porcupine:
+                    # Porcupine wake word detection (on-device, zero network)
+                    pcm_unpacked = struct.unpack_from(
+                        "h" * frame_length, pcm
+                    )
+                    keyword_index = self.porcupine.process(pcm_unpacked)
+                    if keyword_index >= 0:
+                        self.handle_wake(stream)
+                        print(f"👂 Waiting for wake word...\n")
                 else:
-                    idle_count += 1
-                    if idle_count % 1000 == 0:
-                        # Heartbeat every ~30s
-                        sys.stdout.write('.')
-                        sys.stdout.flush()
+                    # Energy-based fallback (for testing without Porcupine)
+                    samples = struct.unpack(f'{len(pcm)//2}h', pcm)
+                    energy = sum(abs(s) for s in samples) / len(samples)
+                    if energy > 2000:  # Loud noise = trigger
+                        self.handle_wake(stream)
+                        print(f"👂 Waiting for wake word...\n")
 
         except KeyboardInterrupt:
-            print("\n\n🛑 Stopping voice listener...")
+            print("\n🛑 Shutting down...")
         finally:
             stream.stop_stream()
             stream.close()
-            self.running = False
-
-    def shutdown(self):
-        """Clean shutdown."""
-        self.running = False
-        self.audio.terminate()
+            if self.porcupine:
+                self.porcupine.delete()
+            self.audio.terminate()
 
 
 def main():
-    listener = VoiceListener()
-    try:
-        listener.listen_loop()
-    finally:
-        listener.shutdown()
+    if not PICOVOICE_ACCESS_KEY:
+        print("=" * 50)
+        print("⚠️  No PICOVOICE_ACCESS_KEY set!")
+        print("   Get a free key: https://console.picovoice.ai")
+        print("   Then: export PICOVOICE_ACCESS_KEY='your_key'")
+        print("   Running in fallback mode (loud noise = trigger)")
+        print("=" * 50)
+
+    voice = UltronVoice()
+    voice.run()
 
 
 if __name__ == '__main__':
